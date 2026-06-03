@@ -20,7 +20,6 @@ DEFAULT_CFG = {
     "launch_wait":      5,
     "client_delay_min": 10,
     "client_delay_max": 15,
-    "deeplink_wait":    12,
 }
 
 CLIENT_PATTERNS = [
@@ -61,7 +60,6 @@ def get_clients() -> list[dict]:
         ["pm", "list", "packages"],
         capture_output=True, text=True
     ).stdout
-
     clients = []
     for line in out.splitlines():
         line = line.strip()
@@ -71,17 +69,9 @@ def get_clients() -> list[dict]:
         if any(p in pkg.lower() for p in CLIENT_PATTERNS):
             label = "Roblox (official)" if pkg == "com.roblox.client" else \
                     " ".join(p.title() for p in pkg.split(".")[-2:])
-            clients.append({
-                "pkg":              pkg,
-                "label":            label,
-                "activity":         None,
-                "deeplink_activity": None,
-            })
-
+            clients.append({"pkg": pkg, "label": label, "activity": None})
     for c in clients:
-        c["activity"]          = get_launcher_activity(c["pkg"])
-        c["deeplink_activity"] = get_deeplink_activity(c["pkg"])
-
+        c["activity"] = get_launcher_activity(c["pkg"])
     return clients
 
 def get_launcher_activity(pkg: str) -> str | None:
@@ -96,8 +86,7 @@ def get_launcher_activity(pkg: str) -> str | None:
         line = line.strip()
         if "/" in line and pkg in line and not line.startswith("No"):
             return line.strip()
-
-    r2   = subprocess.run(["pm", "dump", pkg], capture_output=True, text=True)
+    r2 = subprocess.run(["pm", "dump", pkg], capture_output=True, text=True)
     in_main = False
     for line in r2.stdout.splitlines():
         if "android.intent.action.MAIN" in line:
@@ -106,39 +95,6 @@ def get_launcher_activity(pkg: str) -> str | None:
             m = re.search(rf"({re.escape(pkg)}/[\w.$]+)", line)
             if m:
                 return m.group(1)
-    return None
-
-def get_deeplink_activity(pkg: str) -> str | None:
-    """
-    Find which activity inside pkg handles roblox:// VIEW intents.
-    This is the activity we must target when sending the place deeplink —
-    NOT the launcher/splash activity.
-    """
-    test_url = "roblox://experiences/start?placeId=1"
-    r = subprocess.run(
-        ["cmd", "package", "resolve-activity", "--brief",
-         "-a", "android.intent.action.VIEW",
-         "-d", test_url,
-         "-p", pkg],
-        capture_output=True, text=True
-    )
-    for line in r.stdout.splitlines():
-        line = line.strip()
-        if "/" in line and pkg in line and not line.startswith("No"):
-            return line.strip()
-
-    # fallback: scan pm dump for roblox scheme handler
-    r2 = subprocess.run(["pm", "dump", pkg], capture_output=True, text=True)
-    dump = r2.stdout
-    in_view = False
-    candidate = None
-    for line in dump.splitlines():
-        # look for activity sections that contain roblox scheme
-        m_act = re.search(rf"ActivityInfo\{{[^}}]* ({re.escape(pkg)}/[\w.$]+)", line)
-        if m_act:
-            candidate = m_act.group(1)
-        if candidate and "roblox" in line.lower() and "scheme" in line.lower():
-            return candidate
     return None
 
 # ─── android helpers ──────────────────────────────────────────────────────────
@@ -155,93 +111,75 @@ def is_running(pkg: str) -> bool:
     return pkg in out
 
 def kill_client(pkg: str):
-    rc, _, _ = _sh(["am", "force-stop", pkg])
-    if rc != 0:
-        _, out, _ = _sh(["pidof", pkg])
-        pid = (out.strip().split() or [None])[0]
-        if pid:
-            _sh(["kill", "-9", pid])
+    _sh(["am", "force-stop", pkg])
+    time.sleep(0.5)
+    _, out, _ = _sh(["pidof", pkg])
+    pid = (out.strip().split() or [None])[0]
+    if pid:
+        _sh(["kill", "-9", pid])
 
-def wait_until_running(pkg: str, timeout: int = 30) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if is_running(pkg):
-            return True
-        time.sleep(1)
-    return False
-
-def send_deeplink(c: dict, place_id: str) -> bool:
+def launch_client(c: dict, place_id: str):
     """
-    Send place deeplink directly to the activity that handles roblox:// URIs.
-    Falls back to --package if deeplink_activity wasn't resolved.
-    Tries both deeplink URL formats.
+    Launch Roblox with the place deeplink passed directly at startup.
+    ActivitySplash handles the roblox:// URI on first launch —
+    passing it at start time is the only reliable way.
+    Strategy (tries in order until one works):
+      1. am start -n pkg/ActivitySplash -a VIEW -d roblox://experiences/start?placeId=X
+      2. am start -n pkg/ActivitySplash -a VIEW -d roblox://placeId=X
+      3. am start --package pkg -a VIEW -d roblox://experiences/start?placeId=X
+      4. termux-open-url roblox://experiences/start?placeId=X  (system chooser fallback)
+      5. monkey (no place id — just open app)
     """
-    pkg               = c["pkg"]
-    deeplink_activity = c.get("deeplink_activity")
+    pkg      = c["pkg"]
+    activity = c.get("activity")  # e.g. com.roblox.cliena/com.roblox.client.startup.ActivitySplash
 
-    links = [
-        f"roblox://experiences/start?placeId={place_id}",
-        f"roblox://placeId={place_id}",
-    ]
+    if place_id:
+        links = [
+            f"roblox://experiences/start?placeId={place_id}",
+            f"roblox://placeId={place_id}",
+        ]
 
-    for deep in links:
-        # best: direct component — no chooser, no ambiguity
-        if deeplink_activity:
-            rc, _, _ = _sh([
+        # strategy 1 & 2: pass deeplink directly to launcher activity at start
+        if activity:
+            for deep in links:
+                rc, _, err = _sh([
+                    "am", "start",
+                    "-n", activity,
+                    "-a", "android.intent.action.VIEW",
+                    "-d", deep,
+                    "-f", "0x10000000",   # FLAG_ACTIVITY_NEW_TASK
+                ])
+                console.print(f"[dim]    strategy [-n {activity.split('/')[-1]}] {'✓' if rc==0 else f'✗ {err.strip()[:60]}'}[/dim]")
+                if rc == 0:
+                    return
+
+        # strategy 3: scoped to package, no specific activity
+        for deep in links:
+            rc, _, err = _sh([
                 "am", "start",
-                "-n", deeplink_activity,
+                "--package", pkg,
                 "-a", "android.intent.action.VIEW",
                 "-d", deep,
                 "-f", "0x10000000",
             ])
+            console.print(f"[dim]    strategy [--package] {'✓' if rc==0 else f'✗ {err.strip()[:60]}'}[/dim]")
             if rc == 0:
-                return True
+                return
 
-        # fallback: scoped to package
-        rc, _, _ = _sh([
-            "am", "start",
-            "--package", pkg,
-            "-a", "android.intent.action.VIEW",
-            "-d", deep,
-            "-f", "0x10000000",
-        ])
+        # strategy 4: termux-open-url — lets Android system route to the right app
+        rc, _, _ = _sh(["termux-open-url", f"roblox://experiences/start?placeId={place_id}"])
+        console.print(f"[dim]    strategy [termux-open-url] {'✓' if rc==0 else '✗'}[/dim]")
         if rc == 0:
-            return True
+            return
 
-    return False
+        console.print(f"[red][!] {c['label']}: all deeplink strategies failed — opening main menu[/red]")
 
-def launch_client(c: dict, place_id: str, deeplink_wait: int = 12):
-    pkg      = c["pkg"]
-    activity = c.get("activity")
-
-    # phase 1 — open app (splash/main menu, no deeplink yet)
-    launched = False
+    # fallback / no place_id: just open the app
     if activity:
         rc, _, _ = _sh(["am", "start", "-n", activity, "-f", "0x10000000"])
-        launched = (rc == 0)
-    if not launched:
-        _sh(["monkey", "-p", pkg, "-c", "android.intent.category.LAUNCHER", "1"])
-
-    if not place_id:
-        return
-
-    # phase 2 — wait for process to appear
-    alive = wait_until_running(pkg, timeout=30)
-    if not alive:
-        console.print(f"[red][!] {c['label']} didn't start in time, skipping deeplink[/red]")
-        return
-
-    console.print(f"[dim]  → {c['label']} alive, waiting {deeplink_wait}s for Roblox to load...[/dim]")
-    time.sleep(deeplink_wait)
-
-    # phase 3 — send deeplink to the right activity
-    dl_act = c.get("deeplink_activity") or "not resolved"
-    console.print(f"[dim]  → sending deeplink via [{dl_act.split('/')[-1]}][/dim]")
-    ok = send_deeplink(c, place_id)
-    if ok:
-        console.print(f"[dim]  → {c['label']} deeplink sent ✓ place {place_id}[/dim]")
-    else:
-        console.print(f"[red][!] {c['label']} deeplink failed[/red]")
+        if rc == 0:
+            return
+    _sh(["monkey", "-p", pkg, "-c", "android.intent.category.LAUNCHER", "1"])
 
 # ─── rejoin single ────────────────────────────────────────────────────────────
 
@@ -255,8 +193,8 @@ def rejoin_one(c: dict, cfg: dict, source: str = ""):
         f"[dim]{ts}[/dim] {tag}[green]↑[/green] Launching [bold]{c['label']}[/bold]"
         f"{' → place ' + cfg['place_id'] if cfg['place_id'] else ''}..."
     )
-    launch_client(c, cfg["place_id"], cfg.get("deeplink_wait", 12))
-    console.print(f"[dim]{ts}[/dim] {tag}[bold green]✓[/bold green] {c['label']} relaunched.")
+    launch_client(c, cfg["place_id"])
+    console.print(f"[dim]{ts}[/dim] {tag}[bold green]✓[/bold green] {c['label']} done.")
 
 # ─── rejoin all ───────────────────────────────────────────────────────────────
 
@@ -281,12 +219,7 @@ def rejoin_all(clients: list[dict], cfg: dict, source: str = ""):
             f"[dim]{ts}[/dim] {tag}[green]↑[/green] Launching [bold]{c['label']}[/bold]"
             f"{' → place ' + cfg['place_id'] if cfg['place_id'] else ''}..."
         )
-        t = threading.Thread(
-            target=launch_client,
-            args=(c, cfg["place_id"], cfg.get("deeplink_wait", 12)),
-            daemon=True
-        )
-        t.start()
+        launch_client(c, cfg["place_id"])
 
         if i < len(clients) - 1:
             delay = random.randint(dmin, dmax)
@@ -307,20 +240,15 @@ def watchdog_worker(cfg):
     clients  = get_clients()
     state    = {c["pkg"]: False for c in clients}
     cooldown: dict[str, float] = {}
-
     time.sleep(15)
-
     for c in clients:
         state[c["pkg"]] = is_running(c["pkg"])
-
     while not _stop.is_set():
         clients    = get_clients()
         client_map = {c["pkg"]: c for c in clients}
-
         for c in clients:
             if c["pkg"] not in state:
                 state[c["pkg"]] = is_running(c["pkg"])
-
         now = time.time()
         for pkg, was_running in list(state.items()):
             currently = is_running(pkg)
@@ -341,7 +269,6 @@ def watchdog_worker(cfg):
                     )
                     t.start()
             state[pkg] = currently
-
         _stop.wait(cfg["check_sec"])
 
 # ─── ui helpers ───────────────────────────────────────────────────────────────
@@ -353,28 +280,20 @@ def header():
     console.print(Panel(
         "[bold white]Roblox Multi-Client Rejoin Tool[/bold white]\n"
         f"[dim]config: {CONFIG_PATH}[/dim]",
-        border_style="bright_blue",
-        expand=False
+        border_style="bright_blue", expand=False
     ))
 
 def clients_table(clients: list[dict]):
     tbl = Table(box=box.ROUNDED, border_style="cyan", show_header=True)
-    tbl.add_column("#",               style="bold yellow", width=4)
-    tbl.add_column("Client",          style="bold white")
-    tbl.add_column("Package",         style="dim")
-    tbl.add_column("Launcher",        style="dim", no_wrap=False)
-    tbl.add_column("Deeplink handler",style="dim", no_wrap=False)
-    tbl.add_column("Status",          width=12)
+    tbl.add_column("#",       style="bold yellow", width=4)
+    tbl.add_column("Client",  style="bold white")
+    tbl.add_column("Package", style="dim")
+    tbl.add_column("Activity",style="dim", no_wrap=False)
+    tbl.add_column("Status",  width=12)
     for i, c in enumerate(clients, 1):
-        st   = "[bold green]running[/bold green]" if is_running(c["pkg"]) else "[dim]stopped[/dim]"
-        act  = c["activity"] or "[red]?[/red]"
-        dlact= c["deeplink_activity"] or "[red]not resolved[/red]"
-        tbl.add_row(
-            str(i), c["label"], c["pkg"],
-            act.split("/")[-1],
-            dlact.split("/")[-1],
-            st
-        )
+        st  = "[bold green]running[/bold green]" if is_running(c["pkg"]) else "[dim]stopped[/dim]"
+        act = c["activity"] or "[red]?[/red]"
+        tbl.add_row(str(i), c["label"], c["pkg"], act.split("/")[-1], st)
     return tbl
 
 def cfg_table(cfg, client_count):
@@ -385,7 +304,6 @@ def cfg_table(cfg, client_count):
                 if cfg["place_id"] else "[bold red]NOT SET[/bold red]")
     tbl.add_row("[cyan]Restart every[/cyan]",   f"[bold white]{cfg['interval']} min[/bold white]")
     tbl.add_row("[cyan]Client delay[/cyan]",    f"[bold white]{cfg['client_delay_min']}–{cfg['client_delay_max']}s (random)[/bold white]")
-    tbl.add_row("[cyan]Deeplink wait[/cyan]",   f"[bold white]{cfg['deeplink_wait']}s[/bold white]")
     tbl.add_row("[cyan]Watchdog[/cyan]",
                 "[bold green]ON (per-client)[/bold green]" if cfg["watchdog"] else "[bold red]OFF[/bold red]")
     tbl.add_row("[cyan]Launch cooldown[/cyan]", f"[white]{cfg['launch_wait']}s[/white]")
@@ -438,7 +356,6 @@ def screen_settings(cfg):
         console.print("  [bold white]3[/bold white]  Toggle Watchdog")
         console.print("  [bold white]4[/bold white]  Set launch cooldown (seconds)")
         console.print("  [bold white]5[/bold white]  Set delay between clients (min/max)")
-        console.print("  [bold white]6[/bold white]  Set deeplink wait (seconds after app is alive)")
         console.print("  [bold white]0[/bold white]  Back")
         console.print()
         choice = prompt("Choice")
@@ -469,7 +386,7 @@ def screen_settings(cfg):
 
         elif choice == "4":
             console.print()
-            val = prompt("Cooldown after kill before first launch (s)", cfg["launch_wait"])
+            val = prompt("Cooldown after kill before launch (s)", cfg["launch_wait"])
             try:
                 cfg["launch_wait"] = int(val); save_cfg(cfg)
                 console.print("[green]✓ Saved.[/green]")
@@ -489,22 +406,6 @@ def screen_settings(cfg):
                     cfg["client_delay_min"] = mn
                     cfg["client_delay_max"] = mx
                     save_cfg(cfg); console.print("[green]✓ Saved.[/green]")
-            except ValueError:
-                console.print("[red]Invalid value.[/red]")
-            pause()
-
-        elif choice == "6":
-            console.print()
-            console.print("[dim]Seconds to wait after app is alive before sending deeplink.[/dim]")
-            console.print("[dim]Increase if Roblox loads slowly (try 15–20s).[/dim]\n")
-            val = prompt("Deeplink wait (s)", cfg["deeplink_wait"])
-            try:
-                v = int(val)
-                if v < 1:
-                    console.print("[red]Minimum is 1.[/red]")
-                else:
-                    cfg["deeplink_wait"] = v; save_cfg(cfg)
-                    console.print("[green]✓ Saved.[/green]")
             except ValueError:
                 console.print("[red]Invalid value.[/red]")
             pause()

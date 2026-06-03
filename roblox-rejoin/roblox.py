@@ -120,41 +120,39 @@ def kill_client(pkg: str):
 
 def launch_client(c: dict, place_id: str):
     """
-    Launch Roblox with the place deeplink passed directly at startup.
-    ActivitySplash handles the roblox:// URI on first launch —
-    passing it at start time is the only reliable way.
-    Strategy (tries in order until one works):
-      1. am start -n pkg/ActivitySplash -a VIEW -d roblox://experiences/start?placeId=X
-      2. am start -n pkg/ActivitySplash -a VIEW -d roblox://placeId=X
-      3. am start --package pkg -a VIEW -d roblox://experiences/start?placeId=X
-      4. termux-open-url roblox://experiences/start?placeId=X  (system chooser fallback)
-      5. monkey (no place id — just open app)
+    Tries to launch Roblox and join a specific place.
+    Uses HTTPS URL (www.roblox.com/games/ID) as primary strategy —
+    this is the only intent filter Roblox Android registers in 2024.
+    roblox:// scheme is kept as fallback but usually ignored by newer clients.
     """
     pkg      = c["pkg"]
-    activity = c.get("activity")  # e.g. com.roblox.cliena/com.roblox.client.startup.ActivitySplash
+    activity = c.get("activity")
 
     if place_id:
         links = [
-            f"roblox://experiences/start?placeId={place_id}",
-            f"roblox://placeId={place_id}",
+            f"https://www.roblox.com/games/{place_id}",       # primary — HTTPS intent filter
+            f"roblox://placeID={place_id}",                    # fallback legacy
+            f"roblox://experiences/start?placeId={place_id}",  # fallback new scheme
         ]
 
-        # strategy 1 & 2: pass deeplink directly to launcher activity at start
-        if activity:
-            for deep in links:
+        for deep in links:
+            # strategy 1: direct to launcher activity
+            if activity:
                 rc, _, err = _sh([
                     "am", "start",
                     "-n", activity,
                     "-a", "android.intent.action.VIEW",
                     "-d", deep,
-                    "-f", "0x10000000",   # FLAG_ACTIVITY_NEW_TASK
+                    "-f", "0x10000000",
                 ])
-                console.print(f"[dim]    strategy [-n {activity.split('/')[-1]}] {'✓' if rc==0 else f'✗ {err.strip()[:60]}'}[/dim]")
+                console.print(
+                    f"[dim]    [-n {activity.split('/')[-1]}] "
+                    f"{deep[:55]} {'[green]✓[/green]' if rc == 0 else f'[red]✗[/red] {err.strip()[:40]}'}[/dim]"
+                )
                 if rc == 0:
                     return
 
-        # strategy 3: scoped to package, no specific activity
-        for deep in links:
+            # strategy 2: scoped to package
             rc, _, err = _sh([
                 "am", "start",
                 "--package", pkg,
@@ -162,19 +160,24 @@ def launch_client(c: dict, place_id: str):
                 "-d", deep,
                 "-f", "0x10000000",
             ])
-            console.print(f"[dim]    strategy [--package] {'✓' if rc==0 else f'✗ {err.strip()[:60]}'}[/dim]")
+            console.print(
+                f"[dim]    [--package] "
+                f"{deep[:55]} {'[green]✓[/green]' if rc == 0 else f'[red]✗[/red] {err.strip()[:40]}'}[/dim]"
+            )
             if rc == 0:
                 return
 
-        # strategy 4: termux-open-url — lets Android system route to the right app
-        rc, _, _ = _sh(["termux-open-url", f"roblox://experiences/start?placeId={place_id}"])
-        console.print(f"[dim]    strategy [termux-open-url] {'✓' if rc==0 else '✗'}[/dim]")
+        # strategy 3: termux-open-url — system routes to correct app
+        https_url = f"https://www.roblox.com/games/{place_id}"
+        rc, _, _ = _sh(["termux-open-url", https_url])
+        console.print(f"[dim]    [termux-open-url] {'[green]✓[/green]' if rc == 0 else '[red]✗[/red]'}[/dim]")
         if rc == 0:
             return
 
-        console.print(f"[red][!] {c['label']}: all deeplink strategies failed — opening main menu[/red]")
+        console.print(f"[red][!] {c['label']}: all strategies failed[/red]")
+        return
 
-    # fallback / no place_id: just open the app
+    # no place_id — just open the app
     if activity:
         rc, _, _ = _sh(["am", "start", "-n", activity, "-f", "0x10000000"])
         if rc == 0:
@@ -285,11 +288,11 @@ def header():
 
 def clients_table(clients: list[dict]):
     tbl = Table(box=box.ROUNDED, border_style="cyan", show_header=True)
-    tbl.add_column("#",       style="bold yellow", width=4)
-    tbl.add_column("Client",  style="bold white")
-    tbl.add_column("Package", style="dim")
-    tbl.add_column("Activity",style="dim", no_wrap=False)
-    tbl.add_column("Status",  width=12)
+    tbl.add_column("#",        style="bold yellow", width=4)
+    tbl.add_column("Client",   style="bold white")
+    tbl.add_column("Package",  style="dim")
+    tbl.add_column("Activity", style="dim", no_wrap=False)
+    tbl.add_column("Status",   width=12)
     for i, c in enumerate(clients, 1):
         st  = "[bold green]running[/bold green]" if is_running(c["pkg"]) else "[dim]stopped[/dim]"
         act = c["activity"] or "[red]?[/red]"

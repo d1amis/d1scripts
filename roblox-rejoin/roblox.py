@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # Roblox Multi-Client Rejoin Tool
-# Detects ALL installed Roblox clients and rejoins them simultaneously
 # Requires: pip install rich
 
 import subprocess, threading, time, json, os, sys, re
@@ -19,7 +18,7 @@ DEFAULT_CFG = {
     "watchdog":      True,
     "check_sec":     15,
     "launch_wait":   5,
-    "client_delay":  5,   # seconds between launching each client
+    "client_delay":  5,
 }
 
 CLIENT_PATTERNS = [
@@ -90,7 +89,7 @@ def get_launcher_activity(pkg: str) -> str | None:
         if "/" in line and pkg in line and not line.startswith("No"):
             return line.strip()
 
-    r2 = subprocess.run(["pm", "dump", pkg], capture_output=True, text=True)
+    r2   = subprocess.run(["pm", "dump", pkg], capture_output=True, text=True)
     dump = r2.stdout
     in_main = False
     for line in dump.splitlines():
@@ -100,7 +99,6 @@ def get_launcher_activity(pkg: str) -> str | None:
             m = re.search(rf"({re.escape(pkg)}/[\w.$]+)", line)
             if m:
                 return m.group(1)
-
     return None
 
 # ─── android helpers ──────────────────────────────────────────────────────────
@@ -130,28 +128,21 @@ def launch_client(c: dict, place_id: str):
 
     if place_id:
         deep = f"roblox://experiences/start?placeId={place_id}"
-
         if activity:
             rc, _, _ = _sh([
-                "am", "start",
-                "-n", activity,
+                "am", "start", "-n", activity,
                 "-a", "android.intent.action.VIEW",
-                "-d", deep,
-                "-f", "0x10000000",
+                "-d", deep, "-f", "0x10000000",
             ])
             if rc == 0:
                 return
-
         rc, _, _ = _sh([
-            "am", "start",
-            "--package", pkg,
+            "am", "start", "--package", pkg,
             "-a", "android.intent.action.VIEW",
-            "-d", deep,
-            "-f", "0x10000000",
+            "-d", deep, "-f", "0x10000000",
         ])
         if rc == 0:
             return
-
         if activity:
             _sh(["am", "start", "-n", activity, "-f", "0x10000000"])
             time.sleep(2)
@@ -163,33 +154,45 @@ def launch_client(c: dict, place_id: str):
         else:
             _sh(["monkey", "-p", pkg, "-c", "android.intent.category.LAUNCHER", "1"])
 
-# ─── rejoin logic ─────────────────────────────────────────────────────────────
+# ─── rejoin single ────────────────────────────────────────────────────────────
+
+def rejoin_one(c: dict, cfg: dict, source: str = ""):
+    """Kill and relaunch a single client."""
+    ts  = datetime.now().strftime("%H:%M:%S")
+    tag = f"[dim][{source}][/dim] " if source else ""
+    console.print(f"[dim]{ts}[/dim] {tag}[yellow]↓[/yellow] Killing [bold]{c['label']}[/bold]...")
+    kill_client(c["pkg"])
+    time.sleep(cfg["launch_wait"])
+    console.print(
+        f"[dim]{ts}[/dim] {tag}[green]↑[/green] Launching [bold]{c['label']}[/bold]"
+        f"{' → place ' + cfg['place_id'] if cfg['place_id'] else ''}..."
+    )
+    launch_client(c, cfg["place_id"])
+    console.print(f"[dim]{ts}[/dim] {tag}[bold green]✓[/bold green] {c['label']} relaunched.")
+
+# ─── rejoin all ───────────────────────────────────────────────────────────────
 
 def rejoin_all(clients: list[dict], cfg: dict, source: str = ""):
     if not clients:
         console.print("[bold red]No Roblox clients found![/bold red]")
         return
 
-    ts          = datetime.now().strftime("%H:%M:%S")
-    tag         = f"[dim][{source}][/dim] " if source else ""
-    delay       = cfg.get("client_delay", 5)
+    ts    = datetime.now().strftime("%H:%M:%S")
+    tag   = f"[dim][{source}][/dim] " if source else ""
+    delay = cfg.get("client_delay", 5)
 
-    # kill all first
     for c in clients:
         console.print(f"[dim]{ts}[/dim] {tag}[yellow]↓[/yellow] Killing {c['label']}...")
         kill_client(c["pkg"])
 
     time.sleep(cfg["launch_wait"])
 
-    # launch one by one with delay between each
     for i, c in enumerate(clients):
         console.print(
             f"[dim]{ts}[/dim] {tag}[green]↑[/green] Launching [bold]{c['label']}[/bold]"
             f"{' → place ' + cfg['place_id'] if cfg['place_id'] else ''}..."
         )
         launch_client(c, cfg["place_id"])
-
-        # wait between clients, skip delay after the last one
         if i < len(clients) - 1:
             console.print(f"[dim]{ts}[/dim] {tag}[dim]Waiting {delay}s before next client...[/dim]")
             time.sleep(delay)
@@ -205,15 +208,69 @@ def timer_worker(cfg):
         rejoin_all(clients, cfg, "Timer")
 
 def watchdog_worker(cfg):
-    time.sleep(12)
+    """
+    Watches each client individually.
+    If one dies — only that one gets restarted, not all.
+    Tracks which clients are 'expected running' so it doesn't
+    false-trigger on ones that were never launched yet.
+    """
+    # build initial state — only care about clients we actually launched
+    clients = get_clients()
+    # state dict: pkg -> bool (was running last check)
+    state = {c["pkg"]: False for c in clients}
+    # cooldown per pkg: pkg -> timestamp of last restart
+    cooldown: dict[str, float] = {}
+
+    # wait for initial launch to settle
+    time.sleep(15)
+
+    # mark all currently running as expected
+    for c in clients:
+        state[c["pkg"]] = is_running(c["pkg"])
+
     while not _stop.is_set():
+        # re-detect clients in case something changed
         clients = get_clients()
-        dead = [c for c in clients if not is_running(c["pkg"])]
-        if dead:
-            names = ", ".join(c["label"] for c in dead)
-            console.print(f"\n[bold red][!][/bold red] [Watchdog] Dead: {names} — restarting all...")
-            rejoin_all(clients, cfg, "Watchdog")
-            time.sleep(12)
+        client_map = {c["pkg"]: c for c in clients}
+
+        # add new packages to state
+        for c in clients:
+            if c["pkg"] not in state:
+                state[c["pkg"]] = is_running(c["pkg"])
+
+        now = time.time()
+        for pkg, was_running in list(state.items()):
+            if not was_running:
+                # wasn't running before — update state, don't restart
+                currently = is_running(pkg)
+                state[pkg] = currently
+                continue
+
+            currently = is_running(pkg)
+
+            if was_running and not currently:
+                # it WAS running, now it's DEAD — restart only this one
+                cd = cooldown.get(pkg, 0)
+                if now - cd < 20:
+                    # still in cooldown from last restart — skip
+                    state[pkg] = currently
+                    continue
+
+                c = client_map.get(pkg)
+                if c:
+                    console.print(
+                        f"\n[bold red][!][/bold red] [Watchdog] "
+                        f"[bold]{c['label']}[/bold] died — restarting only this one..."
+                    )
+                    cooldown[pkg] = now
+                    # run in separate thread so other clients keep being watched
+                    t = threading.Thread(
+                        target=rejoin_one, args=(c, cfg, "Watchdog"), daemon=True
+                    )
+                    t.start()
+
+            state[pkg] = currently
+
         _stop.wait(cfg["check_sec"])
 
 # ─── ui helpers ───────────────────────────────────────────────────────────────
@@ -252,7 +309,7 @@ def cfg_table(cfg, client_count):
     tbl.add_row("[cyan]Restart every[/cyan]",   f"[bold white]{cfg['interval']} min[/bold white]")
     tbl.add_row("[cyan]Client delay[/cyan]",    f"[bold white]{cfg['client_delay']}s[/bold white]")
     tbl.add_row("[cyan]Watchdog[/cyan]",
-                "[bold green]ON[/bold green]" if cfg["watchdog"] else "[bold red]OFF[/bold red]")
+                "[bold green]ON (per-client)[/bold green]" if cfg["watchdog"] else "[bold red]OFF[/bold red]")
     tbl.add_row("[cyan]Launch cooldown[/cyan]", f"[white]{cfg['launch_wait']}s[/white]")
     return tbl
 
@@ -376,7 +433,8 @@ def screen_running(cfg):
     console.print()
     console.print(clients_table(clients))
     console.print()
-    console.print("  [bold white]1[/bold white]  Manual rejoin now (all clients)")
+    console.print("  [bold white]1[/bold white]  Manual rejoin — all clients")
+    console.print("  [bold white]2[/bold white]  Manual rejoin — pick one client")
     console.print("  [bold white]0[/bold white]  [bold red]Stop tool[/bold red]")
     console.print()
     choice = prompt("Choice")
@@ -385,6 +443,25 @@ def screen_running(cfg):
         console.print()
         rejoin_all(clients, cfg, "Manual")
         pause()
+
+    elif choice == "2":
+        console.print()
+        for i, c in enumerate(clients, 1):
+            st = "[green]running[/green]" if is_running(c["pkg"]) else "[dim]stopped[/dim]"
+            console.print(f"  [bold yellow]{i}[/bold yellow]  {c['label']} ({st})")
+        console.print()
+        pick = prompt(f"Client number (1-{len(clients)})")
+        try:
+            idx = int(pick) - 1
+            if 0 <= idx < len(clients):
+                console.print()
+                rejoin_one(clients[idx], cfg, "Manual")
+            else:
+                console.print("[red]Invalid number.[/red]")
+        except ValueError:
+            console.print("[red]Invalid input.[/red]")
+        pause()
+
     elif choice == "0":
         _stop.set()
         for t in _threads:
@@ -454,7 +531,7 @@ def main():
         console.print()
 
         if _running:
-            console.print("  [bold white]1[/bold white]  Manage (manual rejoin / stop)")
+            console.print("  [bold white]1[/bold white]  Manage (rejoin / stop)")
         else:
             console.print("  [bold white]1[/bold white]  [bold green]START[/bold green]  — launch ALL clients + start tool")
 

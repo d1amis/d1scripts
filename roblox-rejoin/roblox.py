@@ -14,11 +14,12 @@ console = Console()
 
 CONFIG_PATH = os.path.join(os.environ.get("HOME", "."), ".rblx_rejoin.json")
 DEFAULT_CFG = {
-    "place_id":    "",
-    "interval":    30,
-    "watchdog":    True,
-    "check_sec":   15,
-    "launch_wait": 5,
+    "place_id":      "",
+    "interval":      30,
+    "watchdog":      True,
+    "check_sec":     15,
+    "launch_wait":   5,
+    "client_delay":  5,   # seconds between launching each client
 }
 
 CLIENT_PATTERNS = [
@@ -71,19 +72,12 @@ def get_clients() -> list[dict]:
                     " ".join(p.title() for p in pkg.split(".")[-2:])
             clients.append({"pkg": pkg, "label": label, "activity": None})
 
-    # resolve launcher activity for each client to bypass app chooser
     for c in clients:
         c["activity"] = get_launcher_activity(c["pkg"])
 
     return clients
 
 def get_launcher_activity(pkg: str) -> str | None:
-    """
-    Queries the main LAUNCHER activity of a package.
-    Returns 'pkg/activity' string or None on failure.
-    Uses cmd package resolve-activity first, falls back to pm dump parsing.
-    """
-    # method 1: cmd package resolve-activity (Android 8+)
     r = subprocess.run(
         ["cmd", "package", "resolve-activity", "--brief",
          "-a", "android.intent.action.MAIN",
@@ -93,13 +87,10 @@ def get_launcher_activity(pkg: str) -> str | None:
     )
     for line in r.stdout.splitlines():
         line = line.strip()
-        # output looks like: "pkg/com.example.Activity"
         if "/" in line and pkg in line and not line.startswith("No"):
             return line.strip()
 
-    # method 2: pm dump parsing
     r2 = subprocess.run(["pm", "dump", pkg], capture_output=True, text=True)
-    # look for the activity after MAIN/LAUNCHER block
     dump = r2.stdout
     in_main = False
     for line in dump.splitlines():
@@ -110,8 +101,6 @@ def get_launcher_activity(pkg: str) -> str | None:
             if m:
                 return m.group(1)
 
-    # method 3: monkey trick — get activity from logcat isn't viable,
-    # fall back to None and use deeplink-only launch
     return None
 
 # ─── android helpers ──────────────────────────────────────────────────────────
@@ -136,30 +125,23 @@ def kill_client(pkg: str):
             _sh(["kill", "-9", pid])
 
 def launch_client(c: dict, place_id: str):
-    """
-    Launch a single client directly via its resolved activity component.
-    This bypasses the Android 'Open with' chooser entirely.
-    If activity resolution failed, falls back to --package intent.
-    """
     pkg      = c["pkg"]
-    activity = c.get("activity")  # e.g. "com.lunex.delta01/com.roblox.client.ActivityProtocol"
+    activity = c.get("activity")
 
     if place_id:
         deep = f"roblox://experiences/start?placeId={place_id}"
 
         if activity:
-            # direct component launch — no chooser, no dialog
             rc, _, _ = _sh([
                 "am", "start",
                 "-n", activity,
                 "-a", "android.intent.action.VIEW",
                 "-d", deep,
-                "-f", "0x10000000",   # FLAG_ACTIVITY_NEW_TASK
+                "-f", "0x10000000",
             ])
             if rc == 0:
                 return
 
-        # fallback 1: --package scoped intent
         rc, _, _ = _sh([
             "am", "start",
             "--package", pkg,
@@ -170,14 +152,12 @@ def launch_client(c: dict, place_id: str):
         if rc == 0:
             return
 
-        # fallback 2: launch main activity first, deeplink second
         if activity:
             _sh(["am", "start", "-n", activity, "-f", "0x10000000"])
             time.sleep(2)
             _sh(["am", "start", "--package", pkg,
                  "-a", "android.intent.action.VIEW", "-d", deep])
     else:
-        # no place id — just open the app
         if activity:
             _sh(["am", "start", "-n", activity, "-f", "0x10000000"])
         else:
@@ -190,28 +170,29 @@ def rejoin_all(clients: list[dict], cfg: dict, source: str = ""):
         console.print("[bold red]No Roblox clients found![/bold red]")
         return
 
-    ts  = datetime.now().strftime("%H:%M:%S")
-    tag = f"[dim][{source}][/dim] " if source else ""
+    ts          = datetime.now().strftime("%H:%M:%S")
+    tag         = f"[dim][{source}][/dim] " if source else ""
+    delay       = cfg.get("client_delay", 5)
 
+    # kill all first
     for c in clients:
         console.print(f"[dim]{ts}[/dim] {tag}[yellow]↓[/yellow] Killing {c['label']}...")
         kill_client(c["pkg"])
 
     time.sleep(cfg["launch_wait"])
 
-    launch_threads = []
-    for c in clients:
+    # launch one by one with delay between each
+    for i, c in enumerate(clients):
         console.print(
             f"[dim]{ts}[/dim] {tag}[green]↑[/green] Launching [bold]{c['label']}[/bold]"
             f"{' → place ' + cfg['place_id'] if cfg['place_id'] else ''}..."
         )
-        t = threading.Thread(target=launch_client, args=(c, cfg["place_id"]), daemon=True)
-        t.start()
-        launch_threads.append(t)
-        time.sleep(0.8)
+        launch_client(c, cfg["place_id"])
 
-    for t in launch_threads:
-        t.join(timeout=10)
+        # wait between clients, skip delay after the last one
+        if i < len(clients) - 1:
+            console.print(f"[dim]{ts}[/dim] {tag}[dim]Waiting {delay}s before next client...[/dim]")
+            time.sleep(delay)
 
     console.print(f"[dim]{ts}[/dim] {tag}[bold green]✓[/bold green] All clients launched.")
 
@@ -256,20 +237,20 @@ def clients_table(clients: list[dict]):
     tbl.add_column("Activity", style="dim", no_wrap=False)
     tbl.add_column("Status",   width=12)
     for i, c in enumerate(clients, 1):
-        st  = "[bold green]running[/bold green]" if is_running(c["pkg"]) else "[dim]stopped[/dim]"
-        act = c["activity"] or "[red]not resolved[/red]"
-        # trim activity to just the class part for display
+        st          = "[bold green]running[/bold green]" if is_running(c["pkg"]) else "[dim]stopped[/dim]"
+        act         = c["activity"] or "[red]not resolved[/red]"
         act_display = act.split("/")[-1] if "/" in str(act) else act
         tbl.add_row(str(i), c["label"], c["pkg"], act_display, st)
     return tbl
 
 def cfg_table(cfg, client_count):
     tbl = Table(show_header=False, box=box.SIMPLE_HEAD, padding=(0, 2))
-    tbl.add_row("[cyan]Clients found[/cyan]", f"[bold white]{client_count}[/bold white]")
+    tbl.add_row("[cyan]Clients found[/cyan]",   f"[bold white]{client_count}[/bold white]")
     tbl.add_row("[cyan]Place ID[/cyan]",
                 f"[bold white]{cfg['place_id']}[/bold white]"
                 if cfg["place_id"] else "[dim]not set (main menu)[/dim]")
-    tbl.add_row("[cyan]Restart every[/cyan]", f"[bold white]{cfg['interval']} min[/bold white]")
+    tbl.add_row("[cyan]Restart every[/cyan]",   f"[bold white]{cfg['interval']} min[/bold white]")
+    tbl.add_row("[cyan]Client delay[/cyan]",    f"[bold white]{cfg['client_delay']}s[/bold white]")
     tbl.add_row("[cyan]Watchdog[/cyan]",
                 "[bold green]ON[/bold green]" if cfg["watchdog"] else "[bold red]OFF[/bold red]")
     tbl.add_row("[cyan]Launch cooldown[/cyan]", f"[white]{cfg['launch_wait']}s[/white]")
@@ -322,6 +303,7 @@ def screen_settings(cfg):
         console.print("  [bold white]2[/bold white]  Set restart interval (minutes)")
         console.print("  [bold white]3[/bold white]  Toggle Watchdog")
         console.print("  [bold white]4[/bold white]  Set launch cooldown (seconds)")
+        console.print("  [bold white]5[/bold white]  Set delay between clients (seconds)")
         console.print("  [bold white]0[/bold white]  Back")
         console.print()
         choice = prompt("Choice")
@@ -356,11 +338,26 @@ def screen_settings(cfg):
 
         elif choice == "4":
             console.print()
-            val = prompt("Cooldown seconds", cfg["launch_wait"])
+            val = prompt("Cooldown after kill before first launch (s)", cfg["launch_wait"])
             try:
                 cfg["launch_wait"] = int(val)
                 save_cfg(cfg)
                 console.print("[green]✓ Saved.[/green]")
+            except ValueError:
+                console.print("[red]Invalid value.[/red]")
+            pause()
+
+        elif choice == "5":
+            console.print()
+            val = prompt("Delay between each client launch (s)", cfg["client_delay"])
+            try:
+                v = int(val)
+                if v < 1:
+                    console.print("[red]Minimum is 1 second.[/red]")
+                else:
+                    cfg["client_delay"] = v
+                    save_cfg(cfg)
+                    console.print("[green]✓ Saved.[/green]")
             except ValueError:
                 console.print("[red]Invalid value.[/red]")
             pause()
@@ -485,7 +482,7 @@ def main():
             cfg = load_cfg()
 
         elif choice == "3":
-            pass  # loop auto-refreshes
+            pass
 
         elif choice == "4":
             console.print()

@@ -13,7 +13,7 @@ console = Console()
 
 CONFIG_PATH = os.path.join(os.environ.get("HOME", "."), ".rblx_rejoin.json")
 DEFAULT_CFG = {
-    "place_id":         "",
+    "place_id":         "13379208636",
     "interval":         30,
     "watchdog":         True,
     "check_sec":        15,

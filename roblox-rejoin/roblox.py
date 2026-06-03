@@ -1,8 +1,4 @@
-#!/usr/bin/env python3
-# Roblox Multi-Client Rejoin Tool
-# Requires: pip install rich
-
-import subprocess, threading, time, json, os, sys, re
+import subprocess, threading, time, json, os, sys, re, random
 from datetime import datetime
 from rich.console import Console
 from rich.panel   import Panel
@@ -13,13 +9,14 @@ console = Console()
 
 CONFIG_PATH = os.path.join(os.environ.get("HOME", "."), ".rblx_rejoin.json")
 DEFAULT_CFG = {
-    "place_id":      "",
-    "interval":      30,
-    "watchdog":      True,
-    "check_sec":     15,
-    "launch_wait":   5,
-    "client_delay":  5,
-    "deeplink_wait": 4,   # seconds to wait after app launch before sending deeplink
+    "place_id":         "",
+    "interval":         30,
+    "watchdog":         True,
+    "check_sec":        15,
+    "launch_wait":      5,
+    "client_delay_min": 10,
+    "client_delay_max": 15,
+    "deeplink_wait":    12,
 }
 
 CLIENT_PATTERNS = [
@@ -123,11 +120,17 @@ def kill_client(pkg: str):
         if pid:
             _sh(["kill", "-9", pid])
 
-def send_deeplink(pkg: str, place_id: str):
-    """
-    Send the place deeplink to an already-running app.
-    Two formats tried — some clients use legacy roblox://placeId=X.
-    """
+def wait_until_running(pkg: str, timeout: int = 30) -> bool:
+    """Wait until the process is actually alive before sending deeplink."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if is_running(pkg):
+            return True
+        time.sleep(1)
+    return False
+
+def send_deeplink(pkg: str, place_id: str) -> bool:
+    """Send place deeplink — tries both URL formats."""
     links = [
         f"roblox://experiences/start?placeId={place_id}",
         f"roblox://placeId={place_id}",
@@ -138,39 +141,47 @@ def send_deeplink(pkg: str, place_id: str):
             "--package", pkg,
             "-a", "android.intent.action.VIEW",
             "-d", deep,
-            "-f", "0x10000000",   # FLAG_ACTIVITY_NEW_TASK
+            "-f", "0x10000000",
         ])
         if rc == 0:
             return True
     return False
 
-def launch_client(c: dict, place_id: str, deeplink_wait: int = 4):
+def launch_client(c: dict, place_id: str, deeplink_wait: int = 12):
     """
-    Two-phase launch:
-    1. Start the app via its launcher activity (no deeplink yet)
-    2. Wait for the app to load
-    3. Send deeplink as a separate intent so the app is ready to handle it
+    Phase 1 — launch app to main menu via launcher activity.
+    Phase 2 — wait until process is alive + extra deeplink_wait seconds.
+    Phase 3 — send deeplink so Roblox joins the place.
     """
     pkg      = c["pkg"]
     activity = c.get("activity")
 
-    # phase 1: launch the app
+    # phase 1: open app (main menu, no deeplink yet)
     launched = False
     if activity:
         rc, _, _ = _sh(["am", "start", "-n", activity, "-f", "0x10000000"])
         launched = (rc == 0)
-
     if not launched:
-        rc, _, _ = _sh(["monkey", "-p", pkg,
-                         "-c", "android.intent.category.LAUNCHER", "1"])
-        launched = (rc == 0)
+        _sh(["monkey", "-p", pkg, "-c", "android.intent.category.LAUNCHER", "1"])
 
     if not place_id:
-        return  # no place id — just open the app, done
+        return  # no place id — done
 
-    # phase 2: wait for app to load, then send deeplink
+    # phase 2: wait for process to appear, then wait extra deeplink_wait
+    alive = wait_until_running(pkg, timeout=30)
+    if not alive:
+        console.print(f"[red][!] {c['label']} didn't start in time, skipping deeplink[/red]")
+        return
+
+    console.print(f"[dim]  {c['label']} is alive — waiting {deeplink_wait}s for Roblox to load...[/dim]")
     time.sleep(deeplink_wait)
-    send_deeplink(pkg, place_id)
+
+    # phase 3: send deeplink
+    ok = send_deeplink(pkg, place_id)
+    if ok:
+        console.print(f"[dim]  {c['label']} deeplink sent → place {place_id}[/dim]")
+    else:
+        console.print(f"[red][!] {c['label']} deeplink failed[/red]")
 
 # ─── rejoin single ────────────────────────────────────────────────────────────
 
@@ -184,7 +195,7 @@ def rejoin_one(c: dict, cfg: dict, source: str = ""):
         f"[dim]{ts}[/dim] {tag}[green]↑[/green] Launching [bold]{c['label']}[/bold]"
         f"{' → place ' + cfg['place_id'] if cfg['place_id'] else ''}..."
     )
-    launch_client(c, cfg["place_id"], cfg.get("deeplink_wait", 4))
+    launch_client(c, cfg["place_id"], cfg.get("deeplink_wait", 12))
     console.print(f"[dim]{ts}[/dim] {tag}[bold green]✓[/bold green] {c['label']} relaunched.")
 
 # ─── rejoin all ───────────────────────────────────────────────────────────────
@@ -194,9 +205,10 @@ def rejoin_all(clients: list[dict], cfg: dict, source: str = ""):
         console.print("[bold red]No Roblox clients found![/bold red]")
         return
 
-    ts    = datetime.now().strftime("%H:%M:%S")
-    tag   = f"[dim][{source}][/dim] " if source else ""
-    delay = cfg.get("client_delay", 5)
+    ts      = datetime.now().strftime("%H:%M:%S")
+    tag     = f"[dim][{source}][/dim] " if source else ""
+    dmin    = cfg.get("client_delay_min", 10)
+    dmax    = cfg.get("client_delay_max", 15)
 
     for c in clients:
         console.print(f"[dim]{ts}[/dim] {tag}[yellow]↓[/yellow] Killing {c['label']}...")
@@ -209,15 +221,15 @@ def rejoin_all(clients: list[dict], cfg: dict, source: str = ""):
             f"[dim]{ts}[/dim] {tag}[green]↑[/green] Launching [bold]{c['label']}[/bold]"
             f"{' → place ' + cfg['place_id'] if cfg['place_id'] else ''}..."
         )
-        # launch in thread so deeplink_wait doesn't block other clients
         t = threading.Thread(
             target=launch_client,
-            args=(c, cfg["place_id"], cfg.get("deeplink_wait", 4)),
+            args=(c, cfg["place_id"], cfg.get("deeplink_wait", 12)),
             daemon=True
         )
         t.start()
 
         if i < len(clients) - 1:
+            delay = random.randint(dmin, dmax)
             console.print(f"[dim]{ts}[/dim] {tag}[dim]Waiting {delay}s before next client...[/dim]")
             time.sleep(delay)
 
@@ -232,8 +244,8 @@ def timer_worker(cfg):
         rejoin_all(clients, cfg, "Timer")
 
 def watchdog_worker(cfg):
-    clients   = get_clients()
-    state     = {c["pkg"]: False for c in clients}
+    clients  = get_clients()
+    state    = {c["pkg"]: False for c in clients}
     cooldown: dict[str, float] = {}
 
     time.sleep(15)
@@ -258,7 +270,6 @@ def watchdog_worker(cfg):
                 if now - cd < 20:
                     state[pkg] = currently
                     continue
-
                 c = client_map.get(pkg)
                 if c:
                     console.print(
@@ -270,9 +281,6 @@ def watchdog_worker(cfg):
                         target=rejoin_one, args=(c, cfg, "Watchdog"), daemon=True
                     )
                     t.start()
-            elif not was_running and currently:
-                # just came alive — update state silently
-                pass
 
             state[pkg] = currently
 
@@ -307,16 +315,16 @@ def clients_table(clients: list[dict]):
 
 def cfg_table(cfg, client_count):
     tbl = Table(show_header=False, box=box.SIMPLE_HEAD, padding=(0, 2))
-    tbl.add_row("[cyan]Clients found[/cyan]",    f"[bold white]{client_count}[/bold white]")
+    tbl.add_row("[cyan]Clients found[/cyan]",   f"[bold white]{client_count}[/bold white]")
     tbl.add_row("[cyan]Place ID[/cyan]",
                 f"[bold white]{cfg['place_id']}[/bold white]"
                 if cfg["place_id"] else "[bold red]NOT SET[/bold red]")
-    tbl.add_row("[cyan]Restart every[/cyan]",    f"[bold white]{cfg['interval']} min[/bold white]")
-    tbl.add_row("[cyan]Client delay[/cyan]",     f"[bold white]{cfg['client_delay']}s[/bold white]")
-    tbl.add_row("[cyan]Deeplink wait[/cyan]",    f"[bold white]{cfg['deeplink_wait']}s[/bold white]")
+    tbl.add_row("[cyan]Restart every[/cyan]",   f"[bold white]{cfg['interval']} min[/bold white]")
+    tbl.add_row("[cyan]Client delay[/cyan]",    f"[bold white]{cfg['client_delay_min']}–{cfg['client_delay_max']}s (random)[/bold white]")
+    tbl.add_row("[cyan]Deeplink wait[/cyan]",   f"[bold white]{cfg['deeplink_wait']}s[/bold white]")
     tbl.add_row("[cyan]Watchdog[/cyan]",
                 "[bold green]ON (per-client)[/bold green]" if cfg["watchdog"] else "[bold red]OFF[/bold red]")
-    tbl.add_row("[cyan]Launch cooldown[/cyan]",  f"[white]{cfg['launch_wait']}s[/white]")
+    tbl.add_row("[cyan]Launch cooldown[/cyan]", f"[white]{cfg['launch_wait']}s[/white]")
     return tbl
 
 def prompt(text, default=None):
@@ -366,15 +374,14 @@ def screen_settings(cfg):
         console.print("  [bold white]2[/bold white]  Set restart interval (minutes)")
         console.print("  [bold white]3[/bold white]  Toggle Watchdog")
         console.print("  [bold white]4[/bold white]  Set launch cooldown (seconds)")
-        console.print("  [bold white]5[/bold white]  Set delay between clients (seconds)")
-        console.print("  [bold white]6[/bold white]  Set deeplink wait (seconds after app opens)")
+        console.print("  [bold white]5[/bold white]  Set delay between clients (min/max seconds)")
+        console.print("  [bold white]6[/bold white]  Set deeplink wait (seconds after app is alive)")
         console.print("  [bold white]0[/bold white]  Back")
         console.print()
         choice = prompt("Choice")
 
         if choice == "1":
             console.print()
-            console.print("[dim]Find Place ID in the game URL on roblox.com:[/dim]")
             console.print("[dim]roblox.com/games/[bold]HERE[/bold]/game-name[/dim]\n")
             val = prompt("Place ID", cfg["place_id"] or "")
             cfg["place_id"] = val.strip()
@@ -386,8 +393,7 @@ def screen_settings(cfg):
             console.print()
             val = prompt("Restart every X minutes", cfg["interval"])
             try:
-                cfg["interval"] = int(val)
-                save_cfg(cfg)
+                cfg["interval"] = int(val); save_cfg(cfg)
                 console.print("[green]✓ Saved.[/green]")
             except ValueError:
                 console.print("[red]Invalid value.[/red]")
@@ -396,16 +402,13 @@ def screen_settings(cfg):
         elif choice == "3":
             console.print()
             cfg["watchdog"] = ask_yn("Enable watchdog?", cfg["watchdog"])
-            save_cfg(cfg)
-            console.print("[green]✓ Saved.[/green]")
-            pause()
+            save_cfg(cfg); console.print("[green]✓ Saved.[/green]"); pause()
 
         elif choice == "4":
             console.print()
             val = prompt("Cooldown after kill before first launch (s)", cfg["launch_wait"])
             try:
-                cfg["launch_wait"] = int(val)
-                save_cfg(cfg)
+                cfg["launch_wait"] = int(val); save_cfg(cfg)
                 console.print("[green]✓ Saved.[/green]")
             except ValueError:
                 console.print("[red]Invalid value.[/red]")
@@ -413,31 +416,31 @@ def screen_settings(cfg):
 
         elif choice == "5":
             console.print()
-            val = prompt("Delay between each client launch (s)", cfg["client_delay"])
+            vmin = prompt("Min delay between clients (s)", cfg["client_delay_min"])
+            vmax = prompt("Max delay between clients (s)", cfg["client_delay_max"])
             try:
-                v = int(val)
-                if v < 1:
-                    console.print("[red]Minimum is 1 second.[/red]")
+                mn, mx = int(vmin), int(vmax)
+                if mn < 1 or mx < mn:
+                    console.print("[red]Min must be ≥1 and ≤ max.[/red]")
                 else:
-                    cfg["client_delay"] = v
-                    save_cfg(cfg)
-                    console.print("[green]✓ Saved.[/green]")
+                    cfg["client_delay_min"] = mn
+                    cfg["client_delay_max"] = mx
+                    save_cfg(cfg); console.print("[green]✓ Saved.[/green]")
             except ValueError:
                 console.print("[red]Invalid value.[/red]")
             pause()
 
         elif choice == "6":
             console.print()
-            console.print("[dim]How long to wait after app launches before sending the place deeplink.[/dim]")
-            console.print("[dim]Increase this if Roblox opens but doesn't join the game.[/dim]\n")
+            console.print("[dim]How long to wait after the app process appears before sending the deeplink.[/dim]")
+            console.print("[dim]Increase if Roblox loads slowly on your device (try 15–20s).[/dim]\n")
             val = prompt("Deeplink wait (s)", cfg["deeplink_wait"])
             try:
                 v = int(val)
                 if v < 1:
                     console.print("[red]Minimum is 1 second.[/red]")
                 else:
-                    cfg["deeplink_wait"] = v
-                    save_cfg(cfg)
+                    cfg["deeplink_wait"] = v; save_cfg(cfg)
                     console.print("[green]✓ Saved.[/green]")
             except ValueError:
                 console.print("[red]Invalid value.[/red]")
@@ -448,8 +451,7 @@ def screen_settings(cfg):
 
 def screen_running(cfg):
     global _running
-    clear()
-    header()
+    clear(); header()
     clients = get_clients()
     console.print(Panel(cfg_table(cfg, len(clients)),
                         title="[bold green]● RUNNING[/bold green]",
@@ -464,9 +466,7 @@ def screen_running(cfg):
     choice = prompt("Choice")
 
     if choice == "1":
-        console.print()
-        rejoin_all(clients, cfg, "Manual")
-        pause()
+        console.print(); rejoin_all(clients, cfg, "Manual"); pause()
 
     elif choice == "2":
         console.print()
@@ -478,8 +478,7 @@ def screen_running(cfg):
         try:
             idx = int(pick) - 1
             if 0 <= idx < len(clients):
-                console.print()
-                rejoin_one(clients[idx], cfg, "Manual")
+                console.print(); rejoin_one(clients[idx], cfg, "Manual")
             else:
                 console.print("[red]Invalid number.[/red]")
         except ValueError:
@@ -488,26 +487,20 @@ def screen_running(cfg):
 
     elif choice == "0":
         _stop.set()
-        for t in _threads:
-            t.join(timeout=3)
-        _threads.clear()
-        _stop.clear()
-        _running = False
-        console.print("[yellow]Tool stopped.[/yellow]")
-        pause()
+        for t in _threads: t.join(timeout=3)
+        _threads.clear(); _stop.clear(); _running = False
+        console.print("[yellow]Tool stopped.[/yellow]"); pause()
 
 def start_tool(cfg):
     global _running, _threads
-    if _running:
-        return
+    if _running: return
     clients = get_clients()
     if not clients:
-        console.print("[bold red]No Roblox clients detected![/bold red]")
-        return
+        console.print("[bold red]No Roblox clients detected![/bold red]"); return
     _stop.clear()
     rejoin_all(clients, cfg, "Start")
     if cfg["interval"] > 0:
-        t = threading.Thread(target=timer_worker,    args=(cfg,), daemon=True)
+        t = threading.Thread(target=timer_worker, args=(cfg,), daemon=True)
         t.start(); _threads.append(t)
     if cfg["watchdog"]:
         t = threading.Thread(target=watchdog_worker, args=(cfg,), daemon=True)
@@ -518,15 +511,11 @@ def start_tool(cfg):
 
 def main():
     global _running
-
     cfg = load_cfg()
-
-    # always show where config lives so user knows settings are persistent
     console.print(f"[dim]Config: {CONFIG_PATH}[/dim]")
 
     if not cfg["place_id"]:
-        clear()
-        header()
+        clear(); header()
         console.print(Panel(
             "[bold]First time setup![/bold]\n"
             "Enter the Place ID of the game you want to join.\n"
@@ -534,22 +523,19 @@ def main():
             border_style="yellow", expand=False
         ))
         console.print()
-        console.print("[dim]Find it at: roblox.com/games/[bold]PLACE_ID[/bold]/game-name[/dim]\n")
+        console.print("[dim]roblox.com/games/[bold]PLACE_ID[/bold]/game-name[/dim]\n")
         val = prompt("Place ID (or Enter to skip)")
         cfg["place_id"] = val.strip()
         save_cfg(cfg)
 
     while True:
         clients = get_clients()
-        clear()
-        header()
-
+        clear(); header()
         status_line = "[bold green]● RUNNING[/bold green]" if _running else "[dim]○ Stopped[/dim]"
         console.print(Panel(cfg_table(cfg, len(clients)),
                             title=status_line,
                             border_style="green" if _running else "bright_blue",
                             expand=False))
-
         if clients:
             console.print(clients_table(clients))
         else:
@@ -573,8 +559,7 @@ def main():
             if _running:
                 screen_running(cfg)
             else:
-                console.print()
-                start_tool(cfg)
+                console.print(); start_tool(cfg)
                 if _running:
                     console.print("[bold green]✓ Tool started![/bold green]")
                 else:
@@ -582,24 +567,19 @@ def main():
                 pause()
 
         elif choice == "2":
-            screen_settings(cfg)
-            cfg = load_cfg()
+            screen_settings(cfg); cfg = load_cfg()
 
         elif choice == "3":
             pass
 
         elif choice == "4":
-            console.print()
-            rejoin_all(clients, cfg, "Manual")
-            pause()
+            console.print(); rejoin_all(clients, cfg, "Manual"); pause()
 
         elif choice == "0":
             if _running:
                 _stop.set()
-                for t in _threads:
-                    t.join(timeout=2)
-            console.print("[dim]Bye.[/dim]")
-            sys.exit(0)
+                for t in _threads: t.join(timeout=2)
+            console.print("[dim]Bye.[/dim]"); sys.exit(0)
 
 if __name__ == "__main__":
     try:
